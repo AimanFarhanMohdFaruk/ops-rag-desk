@@ -2,17 +2,104 @@
 
 Support/ops desk: ask over runbooks and tickets with **citations**, escalate with **HITL**, and gate quality in **CI**.
 
-Public portfolio extract — not a dump of a private lab. Patterns ported from a Fastify kit graduate; this repo stays thin and domain-shouting.
+**One-liner:** Hybrid RAG + inspectable agent turns for ops/support workflows you can evaluate and trust.
 
-**One-liner:** Hybrid RAG + agent turns for ops/support workflows you can inspect, evaluate, and trust.
+**Stack:** Fastify · React · Drizzle · Better Auth · pg-boss · Postgres 18 + pgvector · Redis · RustFS · Inbucket
 
-**Stack:** Fastify · [`@fastify/react`](https://vite.fastify.dev/react/) · Drizzle · Better Auth · pg-boss · Postgres 18 + pgvector · Redis · RustFS · Inbucket
+## App tree
 
-Kit seams (MVC, queue, auth): see [AGENTS.md](./AGENTS.md) and [docs/architecture.md](docs/architecture.md).
+Domain seams live under `app/`. Presentation under `client/`. Corpus + eval fixtures under `fixtures/`.
+
+```text
+ops-rag-desk/
+├── app/
+│   ├── controllers/
+│   │   ├── desk/                 # /desk API + page loader
+│   │   │   ├── agent-handlers.ts # accept run, inspect, answer ask
+│   │   │   ├── handlers.ts       # Quick RAG ask
+│   │   │   └── …
+│   │   └── documents/            # upload intake
+│   ├── models/
+│   │   ├── desk-thread.ts        # threads + messages
+│   │   ├── agent-run.ts          # runs + step trace
+│   │   ├── agent-ask.ts          # ask_user HITL rows
+│   │   ├── document.ts
+│   │   └── schema.ts
+│   ├── services/
+│   │   ├── desk-agent/
+│   │   │   ├── run.ts            # accept → enqueue → execute
+│   │   │   ├── tools.ts          # search_ops_docs, list_ops_docs, ask_user
+│   │   │   └── hitl.ts           # detect awaiting_human from tool results
+│   │   ├── retrieval/            # chunk / embed / retrieve / citations
+│   │   ├── parse-document.ts
+│   │   ├── index-document.ts
+│   │   └── eval/                 # offline gate (no OpenAI)
+│   └── queue/
+│       └── handlers.ts           # desk_agent_turn, parse_document, index_document
+├── client/
+│   ├── pages/desk/               # /desk UI (Quick RAG + Agent inspect)
+│   └── components/screen/desk/
+├── cmd/
+│   ├── web/                      # HTTP process
+│   └── worker/                   # job process (agent turns + indexing)
+├── db/migrate/                   # SQL migrations (incl. chunks, runs, asks)
+└── fixtures/
+    ├── ops-corpus/               # demo runbooks / tickets
+    └── eval/rag-cases.json       # CI eval cases
+```
+
+## How an agent run works
+
+**Accept ≠ execute.** HTTP only accepts the turn (persist + queue). The worker runs the model loop and writes an inspectable step trace.
+
+```text
+User message (/desk Agent)
+        │
+        ▼
+ acceptDeskAgentTurn
+   · create/continue desk_thread
+   · if pending ask → answer it
+   · append user message
+   · create agent_run status=queued
+        │
+        ▼
+ enqueue desk_agent_turn { runId }
+        │
+        ▼
+ Worker: executeDeskAgentTurn
+   · claim queued → running
+   · generateText + tools (max 6 steps)
+   · append agent_run_steps: tool_call / tool_result / finish|error
+        │
+        ├─ ask_user fired? ──► status=awaiting_human (park)
+        │                         human reply → new accept + new run
+        │
+        ├─ normal finish ───► status=done + assistant message
+        │
+        └─ error ───────────► status=failed
+```
+
+### Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `queued` | Accepted; waiting for worker |
+| `running` | Model + tools in flight |
+| `awaiting_human` | `ask_user` parked the turn — human must reply |
+| `done` | Final assistant text written to the thread |
+| `failed` | Error recorded on the run |
+
+### Tools
+
+| Tool | Role |
+|------|------|
+| `search_ops_docs` | Retrieve grounded excerpts + citation metadata from the user’s corpus |
+| `list_ops_docs` | List uploaded documents |
+| `ask_user` | Escalate / clarify — creates an ask row and parks the run |
+
+Inspect any run via `GET /api/desk/runs/:id` (steps, output, pending ask) or the Agent panel on `/desk`.
 
 ## Demo loop
-
-**Shipped:**
 
 1. Upload fixtures from `fixtures/ops-corpus/` on the dashboard
 2. Worker: `parse_document` → `index_document`
@@ -41,7 +128,7 @@ Promote an Admin after migrate:
 
 1. Sign up at `/login`
 2. `npm run admin:promote -- you@example.com`
-3. Sign in, open `/admin` (JSON `{ redirectTo }` → `/admin/users`)
+3. Sign in, open `/admin`
 
 Stop compose services: `npm run db:down`
 

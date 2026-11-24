@@ -1,0 +1,143 @@
+# Architecture
+
+How this kit is put together: processes, seams, and request paths. For growing a feature, see [agents/grow-a-feature.md](agents/grow-a-feature.md). For pages and UI, see [agents/frontend-patterns.md](agents/frontend-patterns.md).
+
+## Bet
+
+Fastify owns HTTP. React SSR is a **plugin** (`@fastify/vite` + `@fastify/react`), not the product. Domain lives in fat models under `app/`. Two long-running Node processes share Postgres — not a serverless / App Router / RSC stack.
+
+## Processes
+
+| Process | Entry | Role |
+|---------|-------|------|
+| **web** | `cmd/web/main.ts` | Cookies, `/api/*` controllers, then Vite SSR for HTML |
+| **worker** | `cmd/worker/main.ts` | pg-boss consumer only — never inside the web process |
+
+Both talk to the same Postgres (`DATABASE_URL`). Optional Redis (`REDIS_URL`) is a per-process lazy singleton via `app/redis.ts`. Schema and migrations live under `app/models/schema.ts` → `db/migrate/` (Drizzle). Local object bytes live in RustFS (S3-compatible) via `app/object-store.ts`. Outbound email is `app/mail.ts` (SMTP → Inbucket locally, Resend in prod).
+
+Boot order on web matters: register **API controllers before** `FastifyVite`, so `/api` is never swallowed by the SPA/SSR catch-all.
+
+```
+cmd/web → composeWebApp (app/config.ts)
+  ├── cookie + formbody + multipart
+  ├── registerAuthRoutes / registerPostRoutes / registerWorkRoutes / registerDocumentRoutes   → /api/*
+  └── optional FastifyVite + @fastify/react   → HTML pages (omit in test/harness)
+```
+
+
+## Layers (MVC)
+
+Dependency rule: **inward only**. Models never import controllers, queue, or `client/`.
+
+```
+client/pages  ──getData──►  controllers/<area>/loaders ──► models | services | *Dto
+client/screen ──fetch────►  /api ──► controllers ──► models | services | enqueue
+cmd/worker    ──dequeue──►  app/queue/ (registerWorkers → adapter.work) ──► services (optional models)
+```
+
+| Layer | Path | Owns |
+|-------|------|------|
+| **Models** | `app/models/` | Schema, invariants, queries, Better Auth tables |
+| **Services** | `app/services/` | Cross-model or external side effect; upload policy; job bodies called from `queue` handlers |
+| **API controllers** | `app/controllers/<resource>/` | Fluent `index.ts` + handlers + dto; `requireSession` on private routes → parse → one model/service → `*Dto` JSON |
+| **Page loaders** | `app/controllers/<area>/loaders.ts` | Gate + query + `*Dto` for SSR; page `getData` imports **one** `load*Page` |
+| **Queue** | `app/queue/` | Stupid bus: `handlers`, typed `enqueue`, adapters (pg-boss / inline), `registerWorkers` |
+| **Web composition** | `app/config.ts` | `composeWebApp` — plugins + `/api` registration + optional Vite; used by `cmd/web` and `test/harness` |
+| **Views** | `client/pages/` + `client/components/screen/` | Thin route modules + presentation |
+
+Infra singletons (shared by web + worker): `app/db.ts` (Drizzle), `app/mail.ts`, `app/object-store.ts`, `app/redis.ts`, `app/queue.ts`. Controllers do not open those connections or talk to pg-boss / S3 / mail / Redis directly — except the intentional thin `enqueue` call from a work controller/service.
+
+## Page request path (HTML)
+
+Route modules live under `client/pages/` (folder → URL; home is `pages/index.tsx`).
+
+1. Browser `GET /dashboard`.
+2. `@fastify/react` runs the route’s `getData({ req, reply })` **on the server** before SSR.
+3. `getData` dynamically imports **one** page loader — e.g. `loadDashboardPage` from `app/controllers/dashboard/loaders.ts` — and returns its result as **JSON data only** (including `{ redirectTo }` when the gate denies or a path bounces).
+4. The loader owns session gate, model queries, and `*Dto` mapping. The page does not multi-import `@app` or hand-map fields. **Never** `reply.redirect` in `getData` / `gatePage` / `load*Page` — that breaks client navigations on `/-/data/*`.
+5. React SSR renders the default export; `useRouteContext().data` is the `getData` return value. Pages call `pageRedirect(data)` → `<Navigate>` when `redirectTo` is set.
+6. HTML ships with hydrated route context. Client React takes over for navigation and interactivity.
+
+On **client-side** navigations, the same `getData` runs again on the server via an internal JSON endpoint (`/-/data/…`); the client expects a JSON body (route `data`), not an HTTP 302.
+
+Screens under `client/components/screen/` receive props from the page. They never import `@app/*`; live updates go through `fetch('/api/…')`.
+
+Loader areas today: `admin`, `dashboard`, `home`, `login`.
+
+## API request path (JSON)
+
+Mutations and Better Auth stay on Fastify:
+
+| Surface | Example |
+|---------|---------|
+| Better Auth | `/api/auth/*` (handler in `app/controllers/auth`) |
+| App JSON | `/api/posts` (CRUD), `/api/work` (enqueue), `/api/documents` (upload / list / get) |
+
+Typical controller: `requireSession` on the route → parse → one model or service → `*Dto` → `reply.send`.
+
+Resource JSON for Post / Document is shaped once in `app/controllers/<resource>/dto.ts`. Both `/api` handlers and page **loaders** call those helpers; `client/lib/api.ts` re-exports the DTO types for screens.
+
+Document upload policy (`DOCUMENT_MAX_BYTES`, `DOCUMENT_ACCEPT`, typed `UploadDocumentError`) lives in `app/services/upload-document.ts` — multipart limits and UI accept import from there. HTTP status for `AppError` (including `UploadDocumentError`) is mapped once in `composeWebApp` `setErrorHandler` (`app/errors.ts`).
+
+## Queue path (stupid bus)
+
+The queue is **not** coupled to a domain table. pg-boss holds delivery state (like Redis in Sidekiq); you do not model `pgboss.*`.
+
+1. Caller `enqueue(name, args)` via `app/queue/` (e.g. from `POST /api/work`, or `uploadDocument` → `parse_document`).
+2. `enqueue` → `QueueAdapter.send` (pg-boss in prod; inline in tests via `setQueueAdapter`).
+3. Worker process calls `registerWorkers()` → adapter `work()` (pg-boss consumer on `default`).
+4. Looks up `handlers[name]` and calls the service with `args`.
+5. Service may touch models if the product needs it — **not required** to enqueue.
+
+Demo: `shout` sleeps + logs (no row). Upload enqueues `parse_document` so PDF/text extract does not block the web request.
+
+## Server-only boundary (`app/` ↔ client bundle)
+
+Page modules are shared source for **two** Vite environments: **ssr** (Node) and **client** (browser). A static or dynamic import of `@app/…` from a page would otherwise pull `postgres` into the browser bundle.
+
+This kit’s answer is `vite.app-server-only.ts`, registered in `vite.config.ts`:
+
+| Environment | Import of anything under `app/` |
+|-------------|----------------------------------|
+| **ssr** | Real modules (DB, auth, domain) |
+| **client** | Synthetic stubs with the same export names |
+
+You write clean imports — `await import('@app/models/post')` — no `?server` query, no `server-imports.d.ts`. Aliases:
+
+- Vite + tsconfig: `@app/*` → `app/*`
+- Vite + tsconfig: `@/*` → `client/*`
+
+**Convention:** only call `@app` from inside `getData` (dynamic import). One import of `load*Page` from `app/controllers/<area>/loaders` (admin, dashboard, home, login, …). Screens and page top-level must not import `@app`.
+
+## Auth
+
+Better Auth lives in `app/models/auth` (schema + server instance). The web process mounts its handler under `/api/auth/*`.
+
+| Need | Use |
+|------|-----|
+| Session (in loaders) | `gatePage` → `gate.user` (banned users are null via `getSessionUser`) |
+| Admin flag / authz | `isAdmin(user)` — never `role === 'admin'` |
+| Gate pages | `gatePage(…, policy)` — deny returns `{ redirectTo }` or `{ forbidden: true }` (403); pages `<Navigate>` via `pageRedirect` |
+| Page SSR data | `getData` → one `load*Page` from `controllers/<area>/loaders.ts` |
+| Private `/api` | `requireSession` preHandler; `sessionUser(req)` in handlers |
+
+The browser uses the Better Auth client against the same `/api/auth/*` routes.
+
+## What is intentionally not here
+
+- No Next App Router, RSC, or framework-owned data cache layer
+- No domain rules or business filter/sort in `client/`
+- No job consumer inside `cmd/web`
+- No domain row required just to enqueue background work
+- No second CSS system beyond Tailwind v4 + tweakcn tokens in `client/styles/`
+
+## Map of docs
+
+| Question | Doc |
+|----------|-----|
+| Why this stack / setup / deploy | [README.md](../README.md) |
+| How layers fit together | This file |
+| Add a feature end-to-end | [agents/grow-a-feature.md](agents/grow-a-feature.md) |
+| Pages, screens, `getData`, design system | [agents/frontend-patterns.md](agents/frontend-patterns.md) |
+| Writing tests | [agents/testing-patterns.md](agents/testing-patterns.md) |
+| Test strategy | [testing.md](testing.md) |

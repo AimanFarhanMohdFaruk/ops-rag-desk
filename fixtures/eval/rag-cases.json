@@ -1,0 +1,55 @@
+[
+  {
+    "id": "pos-outage-backup",
+    "query": "POS terminal hung frozen Counter-B backup profile",
+    "corpus": [
+      {
+        "id": "leave",
+        "filename": "leave-cover-runbook.md",
+        "content": "Daily open close checklist. Discount policy escalate owner RM50. Remake once refund needs owner approval."
+      },
+      {
+        "id": "pos",
+        "filename": "ticket-pos-outage.md",
+        "content": "POS terminal hung frozen. Prefer Counter-B backup profile when primary hangs more than 2 minutes. Check switch lights before calling vendor."
+      }
+    ],
+    "expectEmpty": false,
+    "expectContentIncludes": "Counter-B"
+  },
+  {
+    "id": "leave-discount-escalate",
+    "query": "discount policy owner away escalate RM50",
+    "corpus": [
+      {
+        "id": "leave",
+        "filename": "leave-cover-runbook.md",
+        "content": "Do not invent new discount policy. Escalate to owner for anything above RM50 when owner away. Refund needs owner approval."
+      },
+      {
+        "id": "pos",
+        "filename": "ticket-pos-outage.md",
+        "content": "Network switch port flapped. POS lost lease and hung mid-auth. Log outage in Ops Manual."
+      }
+    ],
+    "expectEmpty": false,
+    "expectContentIncludes": "RM50"
+  },
+  {
+    "id": "unrelated-refuse",
+    "query": "capital city France Paris geography",
+    "corpus": [
+      {
+        "id": "leave",
+        "filename": "leave-cover-runbook.md",
+        "content": "Cash reconciliation count drawer at close photo ledger sheet."
+      },
+      {
+        "id": "pos",
+        "filename": "ticket-pos-outage.md",
+        "content": "Log outage start end in the Ops Manual Incidents page."
+      }
+    ],
+    "expectEmpty": true
+  }
+]

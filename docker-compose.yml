@@ -1,0 +1,74 @@
+services:
+  postgres:
+    # Official Postgres 18 with pgvector preinstalled.
+    # Stock postgres images do not ship the vector extension.
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: ops_rag_desk
+      POSTGRES_PASSWORD: ops_rag_desk
+      POSTGRES_DB: ops_rag_desk
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - ops_rag_desk_pg_data:/var/lib/postgresql/data
+      - ./docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ops_rag_desk -d ops_rag_desk']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Local Redis for caches, rate limits, and ephemeral coordination.
+  # Default URL: redis://localhost:6379
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ops_rag_desk_redis_data:/data
+    command: ['redis-server', '--appendonly', 'yes']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # S3-compatible object store (API :9000, console :9001).
+  # Point the app at http://localhost:9000 with forcePathStyle.
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # Local defaults — override before exposing beyond localhost.
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    volumes:
+      - kit_rustfs_data:/data
+
+  # Local SMTP catch-all for magic links (and other mail).
+  # SMTP :2500 → app MAIL_TRANSPORT=smtp. Web UI :8025 (9000 is RustFS).
+  inbucket:
+    image: inbucket/inbucket:latest
+    ports:
+      - "8025:9000" # Web UI
+      - "2500:2500" # SMTP
+    environment:
+      INBUCKET_SMTP_DISABLED: "false"
+      INBUCKET_WEB_DISABLED: "false"
+    volumes:
+      - kit_inbucket_data:/var/inbucket
+
+volumes:
+  ops_rag_desk_pg_data:
+  ops_rag_desk_redis_data:
+  kit_rustfs_data:
+  kit_inbucket_data:

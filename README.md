@@ -142,3 +142,7 @@ Stop compose services: `npm run db:down`
 
 - Private continuous-explore lab stays separate — do not merge lab sprawl here.
 - Zendesk/Intercom product parity is out of scope; one authenticated ops desk + eval proof is the bar.
+
+---
+
+Built on [fastify-react-starter-kit](https://github.com/AimanFarhanMohdFaruk/fastify-react-starter-kit).
